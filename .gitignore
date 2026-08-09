@@ -1,0 +1,4 @@
+node_modules/
+main.js
+src/wispr/wasmBinary.ts
+tests/fixtures/wispr-fixture.sqlite*

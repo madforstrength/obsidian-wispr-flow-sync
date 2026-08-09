@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags: ['*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run inline-wasm
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+      - run: node esbuild.config.mjs production
+
+      - name: Tag must equal manifest version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          MANIFEST=$(node -p "require('./manifest.json').version")
+          echo "tag=$TAG manifest=$MANIFEST"
+          if [ "$TAG" != "$MANIFEST" ]; then
+            echo "::error::Tag '$TAG' does not equal manifest.json version '$MANIFEST'. Obsidian matches these literally — no 'v' prefix."
+            exit 1
+          fi
+
+      - name: Create release with the two required assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF#refs/tags/}" \
+            --title "${GITHUB_REF#refs/tags/}" \
+            --notes "See CHANGELOG or commit history." \
+            main.js manifest.json

@@ -1,0 +1,27 @@
+{
+  "name": "obsidian-wispr-flow-sync",
+  "version": "0.1.0",
+  "description": "Sync Wispr Flow meeting notes and transcripts into your vault.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "inline-wasm": "node scripts/inline-wasm.mjs",
+    "build": "npm run inline-wasm && tsc --noEmit && node esbuild.config.mjs production",
+    "dev": "npm run inline-wasm && node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "fixture": "node scripts/make-fixture.mjs"
+  },
+  "dependencies": {
+    "wa-sqlite": "1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.24.0",
+    "obsidian": "1.13.1",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.10"
+  },
+  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+}

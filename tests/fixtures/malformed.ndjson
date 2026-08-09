@@ -1,0 +1,8 @@
+{"meta":{"v":3,"clock":"recording_active_ms"}}
+{"id":"b1","timestamp":"0:03","text":"Good line.","speaker":{"id":1,"source":"mic","name":null}}
+
+{"id":"b2","timestamp":"0:05","text":"Broken",
+{"id":"b3","timestamp":"0:07","speaker":{"id":1}}
+{"id":"b4","timestamp":"0:09","text":"Last good line.","speaker":{"id":2,"source":"system","name":null}}
+{"id":"marker-1785848634795-paused","timestamp":"6:03 PM","marker":"paused","epochMs":1785848634795,"segment":0}
+{"id":"b5","timestamp":"0:11","text":"Trunca

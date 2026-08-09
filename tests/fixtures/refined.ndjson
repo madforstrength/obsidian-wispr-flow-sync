@@ -1,0 +1,3 @@
+{"id":"a1","timestamp":"00:00","text":"First line.","speaker":{"id":1,"source":"refined","name":null}}
+{"id":"a2","timestamp":"00:03","text":" Second line with padding. ","speaker":{"id":2,"source":"refined","name":null}}
+{"id":"a3","timestamp":"00:09","text":"Third line.","speaker":{"id":2,"source":"refined","name":null}}
