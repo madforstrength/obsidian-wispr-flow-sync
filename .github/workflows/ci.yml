@@ -19,5 +19,9 @@ jobs:
       # typecheck, tests and build all fail on a clean checkout.
       - run: npm run inline-wasm
       - run: npx tsc --noEmit
+      # The SQLite fixture is generated and gitignored too (8 MB, mostly
+      # padding). db/repository/engine tests open it, so it must exist before
+      # vitest runs. Needs the sqlite3 CLI, which ubuntu-latest ships.
+      - run: npm run fixture
       - run: npx vitest run
       - run: node esbuild.config.mjs production

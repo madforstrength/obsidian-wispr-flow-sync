@@ -19,6 +19,8 @@ jobs:
       - run: npm ci
       - run: npm run inline-wasm
       - run: npx tsc --noEmit
+      # Generated, gitignored fixture the db/repository/engine tests open.
+      - run: npm run fixture
       - run: npx vitest run
       - run: node esbuild.config.mjs production
 
