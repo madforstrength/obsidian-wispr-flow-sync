@@ -64,10 +64,13 @@ function yamlScalar(value: string): string {
   // silently misses that file. A raw NUL or other unprintable byte reaching
   // the frontmatter is the same corruption path Stage 1 fixed for the
   // watermark — this sanitising is not cosmetic.
-  /* eslint-disable-next-line no-control-regex -- deliberately stripping controls */
+  /* eslint-disable no-control-regex -- deliberately stripping controls.
+     Must be a block disable, not disable-next-line: the directive has to
+     cover both .replace() lines below, not the `const` line it sits on. */
   const sanitized = value
     .replace(/\r\n|\r|\n|\t|\x0B|\x0C/g, ' ')
     .replace(/[\x00-\x08\x0E-\x1F\x7F-\x9F]/g, '');
+  /* eslint-enable no-control-regex -- scope ends with the strips above */
   // Quote when the value could change YAML meaning.
   if (/^[\w][\w .,'()&/-]*$/.test(sanitized) && !/: |#/.test(sanitized)) return sanitized;
   return `"${sanitized.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
@@ -119,7 +122,7 @@ function substituteSpeakers(
 function stripLeadingThematicBreak(body: string): string {
   const lines = body.split(/\r?\n/);
   const firstNonBlank = lines.findIndex((l) => l.trim() !== '');
-  if (firstNonBlank !== -1 && /^(?:\-{3,}|\*{3,}|_{3,})[ \t]*$/.test(lines[firstNonBlank])) {
+  if (firstNonBlank !== -1 && /^(?:-{3,}|\*{3,}|_{3,})[ \t]*$/.test(lines[firstNonBlank])) {
     return [...lines.slice(0, firstNonBlank), ...lines.slice(firstNonBlank + 1)].join('\n');
   }
   return body;

@@ -106,7 +106,14 @@ export async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<
     } catch (err) {
       lastError = err;
       if (attempt < attempts - 1) {
-        await new Promise((r) => setTimeout(r, 100 * 2 ** attempt));
+        // window.setTimeout, not the bare global: Obsidian popout windows
+        // each own their timer scope, and a timer scheduled on the wrong one
+        // is cancelled when that window closes. This module is also unit
+        // tested in a bare Node environment, which has no `window` — fall
+        // back to globalThis there rather than throwing a ReferenceError.
+        const schedule: (fn: () => void, ms: number) => unknown =
+          typeof window === 'undefined' ? setTimeout : window.setTimeout.bind(window);
+        await new Promise((r) => schedule(() => r(undefined), 100 * 2 ** attempt));
       }
     }
   }

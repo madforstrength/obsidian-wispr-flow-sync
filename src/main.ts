@@ -1,11 +1,19 @@
-import { Notice, Plugin, PluginSettingTab, Setting, TFile, Platform, normalizePath } from 'obsidian';
-import { DEFAULT_SETTINGS, type WisprSyncSettings, type TranscriptHandling } from './settings';
+import {
+  ButtonComponent,
+  Notice,
+  Plugin,
+  PluginSettingTab,
+  TFile,
+  Platform,
+  normalizePath,
+  type SettingDefinitionItem,
+} from 'obsidian';
+import { DEFAULT_SETTINGS, type WisprSyncSettings } from './settings';
 import { locateWispr } from './wispr/locator';
 import { openWisprDatabase } from './wispr/db';
 import { syncMeetings, type VaultAdapter } from './sync/engine';
 import type { Logger } from './logging';
 import type { SubfolderPattern } from './render/paths';
-import type { TitleFilterMode } from './sync/filter';
 
 /** Filename only (not a path) for the debug log, written inside the plugin's
  *  own directory (`manifest.dir`) — never inside the vault's note tree, and
@@ -100,7 +108,10 @@ export default class WisprFlowSyncPlugin extends Plugin {
     // never registered, with no indication to the user why). Fall back to
     // defaults and surface the failure instead of throwing.
     try {
-      this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+      // loadData() is typed `any`; narrow it at the boundary so the spread
+      // below is a checked merge rather than an unsafe assignment.
+      const stored = (await this.loadData()) as Partial<WisprSyncSettings> | null;
+      this.settings = Object.assign({}, DEFAULT_SETTINGS, stored ?? {});
     } catch (err) {
       console.error('[wispr-flow-sync] failed to load settings, using defaults', err);
       this.settings = { ...DEFAULT_SETTINGS };
@@ -164,7 +175,12 @@ export default class WisprFlowSyncPlugin extends Plugin {
       // meeting rather than destroying content it cannot identify. This
       // self-heals: once the cache catches up, the next sync reads the
       // frontmatter, resolves the meeting normally, and updates in place.
-      const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
+      // Asserted to just the two keys read below, not Record<string, unknown>:
+      // FrontMatterCache is an `any`-valued index signature, so a Record cast
+      // is a no-op that leaves `id`/`type` as `any`.
+      const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter as
+        | { wispr_id?: unknown; type?: unknown }
+        | undefined;
       const id = frontmatter?.['wispr_id'];
       const type = frontmatter?.['type'];
       if (typeof id === 'string' && id && (type === 'note' || type === 'transcript')) {
@@ -212,7 +228,9 @@ export default class WisprFlowSyncPlugin extends Plugin {
           // comparing against the EXISTING file's frontmatter is enough to
           // tell "ours, being updated" apart from "not ours" without a
           // second parameter on this method.
-          const existingFrontmatter = this.app.metadataCache.getFileCache(existing)?.frontmatter;
+          const existingFrontmatter = this.app.metadataCache.getFileCache(existing)?.frontmatter as
+            | { wispr_id?: unknown; type?: unknown }
+            | undefined;
           const existingId = existingFrontmatter?.['wispr_id'];
           const existingType = existingFrontmatter?.['type'];
           const newId = content.match(/^wispr_id: (.+)$/m)?.[1]?.trim();
@@ -428,393 +446,344 @@ export default class WisprFlowSyncPlugin extends Plugin {
   }
 }
 
+const SUBFOLDER_OPTIONS: Record<SubfolderPattern, string> = {
+  none: 'None',
+  day: 'Daily (YYYY-MM-DD)',
+  month: 'Monthly (YYYY-MM)',
+  'year-month': 'Year / month (YYYY/MM)',
+  'year-quarter': 'Year / quarter (YYYY/QN)',
+  custom: 'Custom pattern',
+};
+
+/** Text settings where blanking the field must restore the default rather
+ *  than persist an empty string — an empty notes folder would silently write
+ *  every note to the vault root. Mirrors the `v || DEFAULT_SETTINGS.x` guard
+ *  each of these rows carried when the tab rendered itself imperatively. */
+const BLANK_RESTORES_DEFAULT = new Set<string>([
+  'notesFolder',
+  'notesFilenamePattern',
+  'transcriptsFolder',
+  'transcriptFilenamePattern',
+]);
+
 class WisprSyncSettingTab extends PluginSettingTab {
   constructor(private plugin: WisprFlowSyncPlugin) {
     super(plugin.app, plugin);
   }
 
-  display(): void {
-    const { containerEl } = this;
-    containerEl.empty();
+  getControlValue(key: string): unknown {
+    return (this.plugin.settings as unknown as Record<string, unknown>)[key];
+  }
 
+  /** Persists one changed control. The imperative tab normalised each value
+   *  inside its own onChange — clamping the numbers, restoring a default when
+   *  a path was blanked, trimming the data folder. Those guards all live here
+   *  now, so every write goes through exactly one place. */
+  async setControlValue(key: string, value: unknown): Promise<void> {
+    const settings = this.plugin.settings as unknown as Record<string, unknown>;
+
+    let next: unknown = value;
+    if (key === 'syncIntervalSeconds' || key === 'syncHistoryDays') {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed)) return; // ignore garbage, keep current
+      next =
+        key === 'syncIntervalSeconds'
+          ? clampSyncIntervalSeconds(Math.trunc(parsed))
+          : Math.max(0, Math.trunc(parsed));
+    } else if (key === 'wisprDataFolder') {
+      next = String(value).trim();
+    } else if (BLANK_RESTORES_DEFAULT.has(key)) {
+      next = String(value) || DEFAULT_SETTINGS[key as keyof WisprSyncSettings];
+    }
+
+    settings[key] = next;
+    await this.plugin.persist();
+    // Several rows gate on another row's value. The imperative tab re-ran
+    // display() for that; refreshDomState re-evaluates every `disabled`
+    // predicate below in place, without rebuilding the tab.
+    this.refreshDomState();
+  }
+
+  getSettingDefinitions(): SettingDefinitionItem[] {
     const s = this.plugin.settings;
-    const subfolderOptions: Record<SubfolderPattern, string> = {
-      none: 'None',
-      day: 'Daily (YYYY-MM-DD)',
-      month: 'Monthly (YYYY-MM)',
-      'year-month': 'Year / month (YYYY/MM)',
-      'year-quarter': 'Year / quarter (YYYY/QN)',
-      custom: 'Custom pattern',
-    };
-    const addSubfolderOptions = (d: { addOption(v: string, l: string): unknown }): void => {
-      for (const [value, label] of Object.entries(subfolderOptions)) d.addOption(value, label);
-    };
+    const transcriptsOff = (): boolean => !s.syncTranscripts;
+    const transcriptsFolderOff = (): boolean =>
+      !s.syncTranscripts || s.transcriptHandling !== 'custom-location';
 
-    // --- Sync --------------------------------------------------------
-    new Setting(containerEl).setName('Sync').setHeading();
+    return [
+      {
+        type: 'group',
+        heading: 'Sync',
+        items: [
+          {
+            name: 'Enable periodic sync',
+            desc:
+              'Automatically run "Sync now" on a timer. Takes effect after Obsidian reloads this ' +
+              'plugin (toggle it off/on in Community plugins, or restart Obsidian) — an interval ' +
+              'already scheduled cannot be rescheduled in place.',
+            control: { type: 'toggle', key: 'periodicSyncEnabled' },
+          },
+          {
+            name: 'Sync interval',
+            desc:
+              'Seconds between automatic syncs. Minimum 60, maximum 86400 (24 hours). Takes effect ' +
+              'after Obsidian reloads the plugin.',
+            control: {
+              type: 'number',
+              key: 'syncIntervalSeconds',
+              min: MIN_SYNC_INTERVAL_SECONDS,
+              max: MAX_SYNC_INTERVAL_SECONDS,
+            },
+          },
+        ],
+      },
 
-    new Setting(containerEl)
-      .setName('Enable periodic sync')
-      .setDesc(
-        'Automatically run "Sync now" on a timer. Takes effect after Obsidian reloads this ' +
-          'plugin (toggle it off/on in Community plugins, or restart Obsidian) — an interval ' +
-          'already scheduled cannot be rescheduled in place.'
-      )
-      .addToggle((t) =>
-        t.setValue(s.periodicSyncEnabled).onChange((v) => {
-          s.periodicSyncEnabled = v;
-          void this.plugin.persist();
-        })
-      );
+      {
+        type: 'group',
+        heading: 'Notes',
+        items: [
+          {
+            name: 'Sync notes',
+            desc: 'Write a note for each meeting.',
+            control: { type: 'toggle', key: 'syncNotes' },
+          },
+          {
+            name: 'Notes folder',
+            desc:
+              'Where newly-synced meeting notes are saved. Changing this does not move notes that ' +
+              'already exist — they stay where they are, including on a Full sync.',
+            control: { type: 'text', key: 'notesFolder' },
+          },
+          {
+            name: 'Notes subfolder organization',
+            desc:
+              'Nest newly-synced notes under a date-based subfolder inside the notes folder above. ' +
+              'Existing notes are not moved into (or out of) a subfolder when this changes.',
+            control: { type: 'dropdown', key: 'notesSubfolder', options: SUBFOLDER_OPTIONS },
+          },
+          {
+            name: 'Notes custom subfolder pattern',
+            desc:
+              'Only used when subfolder organization above is "Custom pattern". ' +
+              'Tokens: {title} {date} {time} {year} {month} {day} {quarter}.',
+            control: {
+              type: 'text',
+              key: 'notesCustomSubfolder',
+              disabled: () => s.notesSubfolder !== 'custom',
+            },
+          },
+          {
+            name: 'Notes filename pattern',
+            desc:
+              'Tokens: {title} {date} {time} {year} {month} {day} {quarter}. Applies to newly-' +
+              'synced meetings — existing notes are not renamed when this changes.',
+            control: { type: 'text', key: 'notesFilenamePattern' },
+          },
+          {
+            name: 'Resolve speaker names',
+            desc: 'Replace speaker placeholders with real names from Wispr. Applies to notes and transcripts alike.',
+            control: { type: 'toggle', key: 'resolveSpeakerNames' },
+          },
+          {
+            name: 'Flow Summary',
+            desc: 'How the Flow-generated summary is rendered inside the note.',
+            control: {
+              type: 'dropdown',
+              key: 'summaryMode',
+              options: { callout: 'Collapsible callout', heading: 'Plain heading', omit: 'Omit' },
+            },
+          },
+        ],
+      },
 
-    // The one row the brief writes out in full: goes through persist(),
-    // clamps its input, and falls back to the current value on garbage
-    // rather than writing NaN into settings. Every other numeric row below
-    // follows the same shape.
-    new Setting(containerEl)
-      .setName('Sync interval')
-      .setDesc(
-        'Seconds between automatic syncs. Minimum 60, maximum 86400 (24 hours). Takes effect ' +
-          'after Obsidian reloads the plugin.'
-      )
-      .addText((t) =>
-        t
-          .setValue(String(s.syncIntervalSeconds))
-          .onChange((raw) => {
-            const parsed = Number.parseInt(raw, 10);
-            if (!Number.isFinite(parsed)) return; // ignore garbage, keep current
-            s.syncIntervalSeconds = clampSyncIntervalSeconds(parsed);
-            void this.plugin.persist();
-          })
-      );
+      {
+        type: 'group',
+        heading: 'Transcripts',
+        items: [
+          {
+            name: 'Sync transcripts',
+            desc: 'Also sync each meeting\'s transcript (see "Transcript handling" below for where it lands).',
+            control: { type: 'toggle', key: 'syncTranscripts' },
+          },
+          {
+            name: 'Transcript source',
+            desc: 'Refined is cleaner and diarized. Live is the real-time version.',
+            control: {
+              type: 'dropdown',
+              key: 'transcriptSource',
+              options: { refined: 'Refined', live: 'Live' },
+              disabled: transcriptsOff,
+            },
+          },
+          {
+            name: 'Transcript handling',
+            desc:
+              'Custom location: a separate file in its own folder. Same location: a separate file ' +
+              'beside the note. Combined: appended into the note under "## Transcript".',
+            control: {
+              type: 'dropdown',
+              key: 'transcriptHandling',
+              options: {
+                'custom-location': 'Custom location',
+                'same-location': 'Same location as note',
+                combined: 'Combined into note',
+              },
+              disabled: transcriptsOff,
+            },
+          },
+          {
+            name: 'Transcripts folder',
+            desc:
+              'Only used when transcript handling above is "Custom location". Applies to newly-' +
+              'synced meetings — existing transcripts are not moved when this changes.',
+            control: { type: 'text', key: 'transcriptsFolder', disabled: transcriptsFolderOff },
+          },
+          {
+            name: 'Transcripts subfolder organization',
+            desc:
+              'Only used when transcript handling above is "Custom location". Applies to newly-' +
+              'synced meetings — existing transcripts are not moved when this changes.',
+            control: {
+              type: 'dropdown',
+              key: 'transcriptsSubfolder',
+              options: SUBFOLDER_OPTIONS,
+              disabled: transcriptsFolderOff,
+            },
+          },
+          {
+            name: 'Transcripts custom subfolder pattern',
+            desc:
+              'Only used when transcript handling is "Custom location" and subfolder organization ' +
+              'above is "Custom pattern".',
+            control: {
+              type: 'text',
+              key: 'transcriptsCustomSubfolder',
+              disabled: () => transcriptsFolderOff() || s.transcriptsSubfolder !== 'custom',
+            },
+          },
+          {
+            name: 'Transcript filename pattern',
+            desc:
+              'Tokens: {title} {date} {time} {year} {month} {day} {quarter}. Applies to newly-' +
+              'synced meetings — existing transcripts are not renamed when this changes.',
+            control: { type: 'text', key: 'transcriptFilenamePattern', disabled: transcriptsOff },
+          },
+        ],
+      },
 
-    // --- Notes ---------------------------------------------------------
-    new Setting(containerEl).setName('Notes').setHeading();
+      {
+        type: 'group',
+        heading: 'Filtering',
+        items: [
+          {
+            name: 'Sync history',
+            desc: 'Only sync meetings created in the last N days. 0 means no limit.',
+            control: { type: 'number', key: 'syncHistoryDays', min: 0 },
+          },
+          {
+            name: 'Title filter',
+            desc: 'Include or exclude meetings whose title contains a keyword.',
+            control: {
+              type: 'dropdown',
+              key: 'titleFilterMode',
+              options: { disabled: 'Disabled', include: 'Include matching', exclude: 'Exclude matching' },
+            },
+          },
+          {
+            name: 'Title filter keyword',
+            desc: 'Case-insensitive. Only used when the title filter above is not "Disabled".',
+            control: {
+              type: 'text',
+              key: 'titleFilterKeyword',
+              disabled: () => s.titleFilterMode === 'disabled',
+            },
+          },
+          {
+            name: 'Include unfinalized meetings',
+            desc: 'Sync meetings Wispr is still processing.',
+            control: { type: 'toggle', key: 'includeUnfinalized' },
+          },
+        ],
+      },
 
-    new Setting(containerEl)
-      .setName('Sync notes')
-      .setDesc('Write a note for each meeting.')
-      .addToggle((t) =>
-        t.setValue(s.syncNotes).onChange((v) => {
-          s.syncNotes = v;
-          void this.plugin.persist();
-        })
-      );
+      {
+        type: 'group',
+        heading: 'Advanced',
+        items: [
+          {
+            name: 'Wispr Flow data folder',
+            desc: 'Leave empty to use the default location. Read-only; never modified.',
+            control: {
+              type: 'text',
+              key: 'wisprDataFolder',
+              placeholder: '~/Library/Application Support/Wispr Flow',
+            },
+          },
+          {
+            name: 'Reset sync watermark',
+            desc:
+              'Forget what has been synced so the next run re-reads every meeting from Wispr. For ' +
+              'a one-off re-read without touching this setting, use the "Full sync" command ' +
+              'instead. Either way, this only re-reads data from Wispr — it never moves or renames ' +
+              'notes that already exist in your vault; the folder/filename settings above apply ' +
+              'only to newly-synced meetings.',
+            action: (el) => {
+              new ButtonComponent(el).setButtonText('Reset').onClick(() => {
+                this.plugin.settings.latestSyncWatermark = null;
+                void this.plugin.persist();
+                new Notice('Wispr Flow Sync: watermark reset.');
+              });
+            },
+          },
+        ],
+      },
 
-    new Setting(containerEl)
-      .setName('Notes folder')
-      .setDesc(
-        'Where newly-synced meeting notes are saved. Changing this does not move notes that ' +
-          'already exist — they stay where they are, including on a Full sync.'
-      )
-      .addText((t) =>
-        t.setValue(s.notesFolder).onChange((v) => {
-          s.notesFolder = v || DEFAULT_SETTINGS.notesFolder;
-          void this.plugin.persist();
-        })
-      );
+      {
+        type: 'group',
+        heading: 'Debugging',
+        items: [
+          {
+            name: 'Enable debug logging',
+            desc:
+              `Writes a log to "${DEBUG_LOG_FILENAME}" inside this plugin's own folder (not your ` +
+              'note tree). It records meeting ids, counts, and the settings above — never meeting ' +
+              'titles, note bodies, or transcript text.',
+            control: { type: 'toggle', key: 'enableDebugLogging' },
+          },
+          {
+            name: 'Export settings as JSON',
+            desc: 'Copy the current settings (including the sync watermark) to the clipboard, for diagnostics or backup.',
+            action: (el) => {
+              new ButtonComponent(el).setButtonText('Export').onClick(() => {
+                void this.exportSettings();
+              });
+            },
+          },
+          {
+            name: 'Copy logs to clipboard',
+            desc: 'Copy the debug log file to the clipboard.',
+            action: (el) => {
+              new ButtonComponent(el).setButtonText('Copy logs').onClick(() => {
+                void this.plugin.copyLogsToClipboard();
+              });
+            },
+          },
+        ],
+      },
 
-    new Setting(containerEl)
-      .setName('Notes subfolder organization')
-      .setDesc(
-        'Nest newly-synced notes under a date-based subfolder inside the notes folder above. ' +
-          'Existing notes are not moved into (or out of) a subfolder when this changes.'
-      )
-      .addDropdown((d) => {
-        addSubfolderOptions(d);
-        d.setValue(s.notesSubfolder).onChange((v) => {
-          s.notesSubfolder = v as SubfolderPattern;
-          void this.plugin.persist();
-          this.display(); // the custom-pattern row below is only meaningful for 'custom'
-        });
-      });
-
-    new Setting(containerEl)
-      .setName('Notes custom subfolder pattern')
-      .setDesc(
-        'Only used when subfolder organization above is "Custom pattern". ' +
-          'Tokens: {title} {date} {time} {year} {month} {day} {quarter}.'
-      )
-      .setDisabled(s.notesSubfolder !== 'custom')
-      .addText((t) =>
-        t.setValue(s.notesCustomSubfolder).onChange((v) => {
-          s.notesCustomSubfolder = v;
-          void this.plugin.persist();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName('Notes filename pattern')
-      .setDesc(
-        'Tokens: {title} {date} {time} {year} {month} {day} {quarter}. Applies to newly-' +
-          "synced meetings — existing notes are not renamed when this changes."
-      )
-      .addText((t) =>
-        t.setValue(s.notesFilenamePattern).onChange((v) => {
-          s.notesFilenamePattern = v || DEFAULT_SETTINGS.notesFilenamePattern;
-          void this.plugin.persist();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName('Resolve speaker names')
-      .setDesc('Replace speaker placeholders with real names from Wispr. Applies to notes and transcripts alike.')
-      .addToggle((t) =>
-        t.setValue(s.resolveSpeakerNames).onChange((v) => {
-          s.resolveSpeakerNames = v;
-          void this.plugin.persist();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName('Flow Summary')
-      .setDesc('How the Flow-generated summary is rendered inside the note.')
-      .addDropdown((d) =>
-        d
-          .addOption('callout', 'Collapsible callout')
-          .addOption('heading', 'Plain heading')
-          .addOption('omit', 'Omit')
-          .setValue(s.summaryMode)
-          .onChange((v) => {
-            s.summaryMode = v as 'callout' | 'heading' | 'omit';
-            void this.plugin.persist();
-          })
-      );
-
-    // --- Transcripts -----------------------------------------------------
-    new Setting(containerEl).setName('Transcripts').setHeading();
-
-    new Setting(containerEl)
-      .setName('Sync transcripts')
-      .setDesc('Also sync each meeting\'s transcript (see "Transcript handling" below for where it lands).')
-      .addToggle((t) =>
-        t.setValue(s.syncTranscripts).onChange((v) => {
-          s.syncTranscripts = v;
-          void this.plugin.persist();
-          this.display(); // every other row in this section is gated on this
-        })
-      );
-
-    const transcriptsEnabled = s.syncTranscripts;
-    const transcriptsFolderEnabled = transcriptsEnabled && s.transcriptHandling === 'custom-location';
-
-    new Setting(containerEl)
-      .setName('Transcript source')
-      .setDesc('Refined is cleaner and diarized. Live is the real-time version.')
-      .setDisabled(!transcriptsEnabled)
-      .addDropdown((d) =>
-        d
-          .addOption('refined', 'Refined')
-          .addOption('live', 'Live')
-          .setValue(s.transcriptSource)
-          .onChange((v) => {
-            s.transcriptSource = v as 'refined' | 'live';
-            void this.plugin.persist();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName('Transcript handling')
-      .setDesc(
-        'Custom location: a separate file in its own folder. Same location: a separate file ' +
-          'beside the note. Combined: appended into the note under "## Transcript".'
-      )
-      .setDisabled(!transcriptsEnabled)
-      .addDropdown((d) =>
-        d
-          .addOption('custom-location', 'Custom location')
-          .addOption('same-location', 'Same location as note')
-          .addOption('combined', 'Combined into note')
-          .setValue(s.transcriptHandling)
-          .onChange((v) => {
-            s.transcriptHandling = v as TranscriptHandling;
-            void this.plugin.persist();
-            this.display(); // gates the folder rows below
-          })
-      );
-
-    new Setting(containerEl)
-      .setName('Transcripts folder')
-      .setDesc(
-        'Only used when transcript handling above is "Custom location". Applies to newly-' +
-          'synced meetings — existing transcripts are not moved when this changes.'
-      )
-      .setDisabled(!transcriptsFolderEnabled)
-      .addText((t) =>
-        t.setValue(s.transcriptsFolder).onChange((v) => {
-          s.transcriptsFolder = v || DEFAULT_SETTINGS.transcriptsFolder;
-          void this.plugin.persist();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName('Transcripts subfolder organization')
-      .setDesc(
-        'Only used when transcript handling above is "Custom location". Applies to newly-' +
-          'synced meetings — existing transcripts are not moved when this changes.'
-      )
-      .setDisabled(!transcriptsFolderEnabled)
-      .addDropdown((d) => {
-        addSubfolderOptions(d);
-        d.setValue(s.transcriptsSubfolder).onChange((v) => {
-          s.transcriptsSubfolder = v as SubfolderPattern;
-          void this.plugin.persist();
-          this.display(); // gates the custom-pattern row below
-        });
-      });
-
-    new Setting(containerEl)
-      .setName('Transcripts custom subfolder pattern')
-      .setDesc(
-        'Only used when transcript handling is "Custom location" and subfolder organization ' +
-          'above is "Custom pattern".'
-      )
-      .setDisabled(!transcriptsFolderEnabled || s.transcriptsSubfolder !== 'custom')
-      .addText((t) =>
-        t.setValue(s.transcriptsCustomSubfolder).onChange((v) => {
-          s.transcriptsCustomSubfolder = v;
-          void this.plugin.persist();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName('Transcript filename pattern')
-      .setDesc(
-        'Tokens: {title} {date} {time} {year} {month} {day} {quarter}. Applies to newly-' +
-          'synced meetings — existing transcripts are not renamed when this changes.'
-      )
-      .setDisabled(!transcriptsEnabled)
-      .addText((t) =>
-        t.setValue(s.transcriptFilenamePattern).onChange((v) => {
-          s.transcriptFilenamePattern = v || DEFAULT_SETTINGS.transcriptFilenamePattern;
-          void this.plugin.persist();
-        })
-      );
-
-    // --- Filtering -------------------------------------------------------
-    new Setting(containerEl).setName('Filtering').setHeading();
-
-    new Setting(containerEl)
-      .setName('Sync history')
-      .setDesc('Only sync meetings created in the last N days. 0 means no limit.')
-      .addText((t) =>
-        t
-          .setValue(String(s.syncHistoryDays))
-          .onChange((raw) => {
-            const parsed = Number.parseInt(raw, 10);
-            if (!Number.isFinite(parsed)) return; // ignore garbage, keep current
-            s.syncHistoryDays = Math.max(0, parsed);
-            void this.plugin.persist();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName('Title filter')
-      .setDesc('Include or exclude meetings whose title contains a keyword.')
-      .addDropdown((d) =>
-        d
-          .addOption('disabled', 'Disabled')
-          .addOption('include', 'Include matching')
-          .addOption('exclude', 'Exclude matching')
-          .setValue(s.titleFilterMode)
-          .onChange((v) => {
-            s.titleFilterMode = v as TitleFilterMode;
-            void this.plugin.persist();
-            this.display(); // gates the keyword row below
-          })
-      );
-
-    new Setting(containerEl)
-      .setName('Title filter keyword')
-      .setDesc('Case-insensitive. Only used when the title filter above is not "Disabled".')
-      .setDisabled(s.titleFilterMode === 'disabled')
-      .addText((t) =>
-        t.setValue(s.titleFilterKeyword).onChange((v) => {
-          s.titleFilterKeyword = v;
-          void this.plugin.persist();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName('Include unfinalized meetings')
-      .setDesc('Sync meetings Wispr is still processing.')
-      .addToggle((t) =>
-        t.setValue(s.includeUnfinalized).onChange((v) => {
-          s.includeUnfinalized = v;
-          void this.plugin.persist();
-        })
-      );
-
-    // --- Advanced --------------------------------------------------------
-    new Setting(containerEl).setName('Advanced').setHeading();
-
-    new Setting(containerEl)
-      .setName('Wispr Flow data folder')
-      .setDesc('Leave empty to use the default location. Read-only; never modified.')
-      .addText((t) =>
-        t.setPlaceholder('~/Library/Application Support/Wispr Flow')
-          .setValue(s.wisprDataFolder)
-          .onChange((v) => {
-            s.wisprDataFolder = v.trim();
-            void this.plugin.persist();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName('Reset sync watermark')
-      .setDesc(
-        'Forget what has been synced so the next run re-reads every meeting from Wispr. For ' +
-          'a one-off re-read without touching this setting, use the "Full sync" command ' +
-          'instead. Either way, this only re-reads data from Wispr — it never moves or renames ' +
-          'notes that already exist in your vault; the folder/filename settings above apply ' +
-          'only to newly-synced meetings.'
-      )
-      .addButton((b) =>
-        b.setButtonText('Reset').onClick(() => {
-          s.latestSyncWatermark = null;
-          void this.plugin.persist();
-          new Notice('Wispr Flow Sync: watermark reset.');
-        })
-      );
-
-    // --- Debugging ---------------------------------------------------------
-    new Setting(containerEl).setName('Debugging').setHeading();
-
-    new Setting(containerEl)
-      .setName('Enable debug logging')
-      .setDesc(
-        `Writes a log to "${DEBUG_LOG_FILENAME}" inside this plugin's own folder (not your ` +
-          'note tree). It records meeting ids, counts, and the settings above — never meeting ' +
-          'titles, note bodies, or transcript text.'
-      )
-      .addToggle((t) =>
-        t.setValue(s.enableDebugLogging).onChange((v) => {
-          s.enableDebugLogging = v;
-          void this.plugin.persist();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName('Export settings as JSON')
-      .setDesc('Copy the current settings (including the sync watermark) to the clipboard, for diagnostics or backup.')
-      .addButton((b) =>
-        b.setButtonText('Export').onClick(() => { void this.exportSettings(); })
-      );
-
-    new Setting(containerEl)
-      .setName('Copy logs to clipboard')
-      .setDesc('Copy the debug log file to the clipboard.')
-      .addButton((b) =>
-        b.setButtonText('Copy logs').onClick(() => { void this.plugin.copyLogsToClipboard(); })
-      );
-
-    // --- Support -----------------------------------------------------------
-    // No issue-tracker link yet — see the NOTE near the top of this file for
-    // why a placeholder URL is not an acceptable substitute.
-    new Setting(containerEl)
-      .setName('Support')
-      .setDesc('The issue tracker link will be added here once this plugin is released.')
-      .setHeading();
+      // No issue-tracker link yet — see the NOTE near the top of this file for
+      // why a placeholder URL is not an acceptable substitute.
+      {
+        type: 'group',
+        heading: 'Support',
+        items: [
+          {
+            name: 'Issue tracker',
+            desc: 'The issue tracker link will be added here once this plugin is released.',
+          },
+        ],
+      },
+    ];
   }
 
   /** Copies the settings object verbatim (no transformation, watermark

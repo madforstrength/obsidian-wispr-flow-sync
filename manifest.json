@@ -1,8 +1,8 @@
 {
   "id": "wispr-flow-sync",
   "name": "Wispr Flow Sync",
-  "version": "0.1.1",
-  "minAppVersion": "1.5.0",
+  "version": "0.1.2",
+  "minAppVersion": "1.13.0",
   "description": "Sync Wispr Flow meeting notes and transcripts into your vault. Reads local files only and never connects to the network.",
   "author": "Muhammad Bilal",
   "authorUrl": "https://github.com/madforstrength",

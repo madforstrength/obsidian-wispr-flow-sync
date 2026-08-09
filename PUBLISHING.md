@@ -102,10 +102,10 @@ After submission, automated and human review may leave feedback (for example, ab
 Before submitting, confirm all of the following:
 
 - [ ] `manifest.json`'s `id` is `wispr-flow-sync` and `name` is `Wispr Flow Sync` — neither contains the word "Obsidian" (not permitted in plugin names/ids).
-- [ ] `manifest.json` has `"isDesktopOnly": true` and `"minAppVersion": "1.5.0"`.
+- [ ] `manifest.json` has `"isDesktopOnly": true` and `"minAppVersion": "1.13.0"` — raised from 1.5.0 when the settings tab moved to the declarative `getSettingDefinitions()` API, which does not exist before 1.13.0.
 - [ ] `manifest.json`'s `description` is under 250 characters, starts with a verb, ends with a period, and contains no emoji.
 - [ ] `README.md` and `LICENSE` are both present at the repository root.
-- [ ] The release tag equals `manifest.json`'s `version` exactly (currently `0.1.0`, no `v` prefix).
+- [ ] The release tag equals `manifest.json`'s `version` exactly (currently `0.1.2`, no `v` prefix).
 - [ ] The release has `main.js` and `manifest.json` attached as individual files, not zipped together.
 
 ## 8. What to expect on review

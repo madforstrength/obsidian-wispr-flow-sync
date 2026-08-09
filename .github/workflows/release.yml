@@ -5,7 +5,10 @@ on:
     tags: ['*']
 
 permissions:
-  contents: write
+  contents: write # create the release and upload its assets
+  id-token: write # mint the OIDC token for a Sigstore signing certificate
+  attestations: write # persist the attestation
+  artifact-metadata: write # create the artifact storage record
 
 jobs:
   release:
@@ -33,6 +36,16 @@ jobs:
             echo "::error::Tag '$TAG' does not equal manifest.json version '$MANIFEST'. Obsidian matches these literally — no 'v' prefix."
             exit 1
           fi
+
+      # Attests the exact main.js that ships below, so anyone can verify it was
+      # built by this workflow from this repo:
+      #   gh attestation verify main.js --repo madforstrength/obsidian-wispr-flow-sync
+      # Runs after the tag guard so a mismatched tag never produces one, and
+      # before the upload so an unattested asset is never published.
+      - name: Attest build provenance for main.js
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: main.js
 
       - name: Create release with the two required assets
         env:

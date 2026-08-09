@@ -56,10 +56,15 @@ let sqlite3Promise: Promise<SQLiteAPI> | null = null;
  *  `import.meta.url` is a real URL there. */
 function getSqlite3(): Promise<SQLiteAPI> {
   sqlite3Promise ??= (async () => {
-    const module = await SQLiteESMFactory({
+    // Both wa-sqlite entry points are typed `any` (ModuleFactory returns
+    // Promise<any>, Factory takes any), so nothing here is checked by the
+    // compiler. Narrowing to `object` is the strongest honest type for an
+    // opaque Emscripten module: it kills the `any` without claiming a shape
+    // we don't actually know, and Factory accepts it unchanged.
+    const module = (await SQLiteESMFactory({
       wasmBinary: base64ToBytes(WASM_BASE64),
       locateFile: () => 'wa-sqlite.wasm',
-    });
+    })) as object;
     return SQLite.Factory(module);
   })();
   return sqlite3Promise;

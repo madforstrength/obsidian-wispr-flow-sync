@@ -53,6 +53,9 @@ Obsidian's developer policies require plugins to disclose access outside the vau
 | Disclosure | Answer |
 |---|---|
 | Files accessed outside the vault | `~/Library/Application Support/Wispr Flow/` — `flow.sqlite` and `meetings/*.ndjson`, opened **read-only**. Justified: Wispr Flow stores meeting notes only there and exposes no local API, so there is no other way to read the data the user is asking to sync. The plugin never writes to, moves, or deletes any Wispr Flow file. |
+| Node `fs` usage | Read-only, without exception: `existsSync`, `statSync`, `readFileSync`, `fstatSync`, `readSync`, and `openSync(path, 'r')` — the read-mode flag. The plugin calls no `fs` write API at all (no `writeFile`, `appendFile`, `mkdir`, `unlink`, `rename`, or `createWriteStream`). The optional debug log is the only file this plugin writes outside your note tree, and it goes through Obsidian's own `vault.adapter.append` into the plugin's folder — not through `fs`. |
+| Vault enumeration | One call to `vault.getMarkdownFiles()`, to index existing notes by their `wispr_id` frontmatter. Justified: without it, a re-sync cannot tell that a meeting's note already exists after you move or rename it, and would write a duplicate instead of updating in place. Only frontmatter is inspected; note bodies are never read during indexing. |
+| Clipboard access | **Write-only**, and only when you press a button: "Export settings as JSON" and "Copy logs to clipboard" in settings. The plugin calls `navigator.clipboard.writeText` and never `readText`, so it cannot see anything you copied from elsewhere. |
 | Network access | None. The plugin makes no network requests of any kind. |
 | Telemetry | None, client-side or server-side. |
 | Account or paid features | None. Works with Wispr Flow's free tier. |

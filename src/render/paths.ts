@@ -10,6 +10,7 @@ const CONTROL = /[\x00-\x08\x0E-\x1F\x7F-\x9F]/g;
  *  rather than vanish. markdown.ts's yamlScalar treats them identically, so
  *  a title survives with the same visible words in both the frontmatter
  *  and the filename. */
+/* eslint-disable-next-line no-control-regex -- deliberately matching controls */
 const WHITESPACE_CONTROLS = /[\x09\x0A\x0D\x0B\x0C]/g;
 const MAX_SEGMENT = 120;
 
