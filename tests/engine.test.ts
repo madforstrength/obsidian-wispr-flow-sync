@@ -80,6 +80,7 @@ function fakeOpenDatabase(
     },
     async close() {},
     stats: { reads: 0, bytes: 0 },
+    walFrames: null,
   });
 }
 

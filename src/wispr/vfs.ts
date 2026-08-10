@@ -2,10 +2,27 @@
 // (src/types/index.d.ts) provides ambient module typings for this deep
 // import, so no @ts-expect-error is needed (and would be flagged unused).
 import * as VFS from 'wa-sqlite/src/VFS.js';
+import type { WalSnapshot } from './wal';
 
 export type Fs = typeof import('node:fs');
 
-interface OpenFile { fd: number; size: number }
+/**
+ * A WAL read snapshot bound to the descriptor it was computed from, plus
+ * the database path it belongs to. `openWisprDatabase` builds this and
+ * hands it to `beginOpen` so that the file SQLite is about to open can be
+ * matched to it by path.
+ *
+ * Descriptor ownership stays with the caller: `xClose` deliberately does
+ * NOT close `walFd`, because the same overlay outlives any individual
+ * SQLite file slot and the handle's own `close()` is what releases it.
+ */
+export interface WalOverlay {
+  dbPath: string;
+  walFd: number;
+  snapshot: WalSnapshot;
+}
+
+interface OpenFile { fd: number; size: number; overlay?: WalOverlay }
 
 /** Opaque token identifying one `openWisprDatabase` handle's read
  *  accounting. See `beginOpen`/`endOpen`/`statsFor`/`forgetOwner`. */
@@ -22,7 +39,11 @@ interface OwnerStats { reads: number; bytes: number }
  *     path, so SQLite fails before ever calling xOpen.
  *  2. Filenames arrive with URI query strings still attached, so strip `?...`.
  *  3. Callers must open with `immutable=1`, because this VFS implements no
- *     shared-memory methods and the database is in WAL mode.
+ *     shared-memory methods and the database is in WAL mode. `immutable=1`
+ *     also makes SQLite ignore the `-wal` file, which on a live Wispr Flow
+ *     install is where most (sometimes all) of the data is — so this VFS
+ *     performs the WAL read itself, via the `WalOverlay` passed to
+ *     `beginOpen`. See `wal.ts` for why that is not optional.
  *
  * A fourth requirement, found by review against the real 217 MB database:
  * every method SQLite can call synchronously during a query (xRead,
@@ -64,6 +85,18 @@ export class NodeReadOnlyVFS extends VFSBase implements SQLiteVFS {
   #ownerByFileId = new Map<number, VfsOwner>();
   #statsByOwner = new Map<VfsOwner, OwnerStats>();
 
+  /** Set for the duration of one `beginOpen`/`endOpen` window, alongside
+   *  `#currentOwner`, and attached to whichever file SQLite opens at the
+   *  overlay's own `dbPath` during that window. */
+  #currentOverlay: WalOverlay | null = null;
+
+  /** Whether the overlay handed to the most recent `beginOpen` was actually
+   *  attached to a file. Read by `openWisprDatabase` to turn a silent
+   *  path-matching miss into a loud failure — an unattached overlay means
+   *  the handle would read the main file alone, which is the exact
+   *  data-loss behaviour this whole mechanism exists to end. */
+  #overlayAttached = false;
+
   constructor(name: string, fs: Fs) {
     super();
     this.name = name;
@@ -74,12 +107,36 @@ export class NodeReadOnlyVFS extends VFSBase implements SQLiteVFS {
     return String(name ?? '').split('?')[0];
   }
 
+  /** Path comparison for overlay matching only — never for opening.
+   *  SQLite hands back the filename from the URI essentially verbatim, so an
+   *  exact match is the normal case; normalising separators and case buys
+   *  tolerance on Windows, where the same file can legitimately be spelled
+   *  more than one way and a miss would silently cost the user their WAL. */
+  static #samePath(a: string, b: string): boolean {
+    const norm = (p: string): string => p.replace(/\\/g, '/').toLowerCase();
+    return norm(a) === norm(b);
+  }
+
+  /** True when the overlay passed to the most recent `beginOpen` was
+   *  attached to a file. Meaningless if no overlay was passed. */
+  didAttachOverlay(): boolean {
+    return this.#overlayAttached;
+  }
+
   /** Call immediately before an `open_v2` that will make SQLite call
    *  `xOpen` for a new handle. Every `fileId` opened until the matching
-   *  `endOpen()` is attributed to the returned token. */
-  beginOpen(): VfsOwner {
+   *  `endOpen()` is attributed to the returned token.
+   *
+   *  `overlay`, when given, is attached to the file opened at its own
+   *  `dbPath` during this window, so that file's reads are served from the
+   *  WAL snapshot. It is scoped to the window for the same reason the owner
+   *  token is: this VFS is a shared singleton, and two handles opening
+   *  different databases must not inherit each other's overlay. */
+  beginOpen(overlay?: WalOverlay | null): VfsOwner {
     const owner: VfsOwner = Symbol('wispr-db-handle');
     this.#currentOwner = owner;
+    this.#currentOverlay = overlay ?? null;
+    this.#overlayAttached = false;
     this.#statsByOwner.set(owner, { reads: 0, bytes: 0 });
     return owner;
   }
@@ -89,6 +146,7 @@ export class NodeReadOnlyVFS extends VFSBase implements SQLiteVFS {
    *  xOpen calls happening outside of an open are never misattributed. */
   endOpen(): void {
     this.#currentOwner = null;
+    this.#currentOverlay = null;
   }
 
   /** Reads and bytes attributed to `owner` so far. Returns zeros for an
@@ -121,7 +179,17 @@ export class NodeReadOnlyVFS extends VFSBase implements SQLiteVFS {
     }
     try {
       const fd = this.#fs.openSync(path, 'r');
-      this.#files.set(fileId, { fd, size: this.#fs.fstatSync(fd).size });
+      // Matched by path, not "the first file opened": with immutable=1
+      // SQLite opens only the main database, but that is its choice, not a
+      // guarantee we should encode. Attaching by path means a temp or
+      // journal file opened for any reason can never be served pages from
+      // the database's WAL.
+      const overlay =
+        this.#currentOverlay && NodeReadOnlyVFS.#samePath(this.#currentOverlay.dbPath, path)
+          ? this.#currentOverlay
+          : undefined;
+      if (overlay) this.#overlayAttached = true;
+      this.#files.set(fileId, { fd, size: this.#fs.fstatSync(fd).size, overlay });
       if (this.#currentOwner !== null) {
         this.#ownerByFileId.set(fileId, this.#currentOwner);
       }
@@ -150,7 +218,9 @@ export class NodeReadOnlyVFS extends VFSBase implements SQLiteVFS {
     // is what turned a bad read into a leaked fd. Report it as a normal
     // SQLite IO error instead, so the engine's own cleanup path runs.
     try {
-      const n = this.#fs.readSync(f.fd, pData, 0, pData.byteLength, iOffset);
+      const n = f.overlay
+        ? this.#readWithOverlay(f, f.overlay, pData, iOffset)
+        : this.#fs.readSync(f.fd, pData, 0, pData.byteLength, iOffset);
       const owner = this.#ownerByFileId.get(fileId);
       if (owner !== undefined) {
         const s = this.#statsByOwner.get(owner);
@@ -169,11 +239,61 @@ export class NodeReadOnlyVFS extends VFSBase implements SQLiteVFS {
     }
   }
 
+  /**
+   * Serves a read page by page, taking each page from the WAL snapshot when
+   * it holds a newer committed copy and from the main file otherwise.
+   *
+   * Page-at-a-time rather than "is this whole request one WAL page?":
+   * SQLite's very first read is the 100-byte database header at offset 0,
+   * and page 1 is routinely a page the WAL has rewritten, so a whole-page
+   * assumption is wrong on the first call. Splitting at page boundaries
+   * handles the header read, ordinary page reads, and any hypothetical
+   * multi-page read with one code path.
+   *
+   * Returns the number of bytes filled, matching `fs.readSync`'s contract,
+   * so the caller's short-read handling is unchanged.
+   */
+  #readWithOverlay(f: OpenFile, overlay: WalOverlay, pData: Uint8Array, iOffset: number): number {
+    const { pages, pageSize } = overlay.snapshot;
+    let filled = 0;
+
+    while (filled < pData.byteLength) {
+      const position = iOffset + filled;
+      const pageNo = Math.floor(position / pageSize) + 1;
+      const withinPage = position % pageSize;
+      const want = Math.min(pData.byteLength - filled, pageSize - withinPage);
+      const target = pData.subarray(filled, filled + want);
+
+      const frameDataOffset = pages.get(pageNo);
+      const n =
+        frameDataOffset === undefined
+          ? this.#fs.readSync(f.fd, target, 0, want, position)
+          : this.#fs.readSync(overlay.walFd, target, 0, want, frameDataOffset + withinPage);
+
+      filled += n;
+      // Short read: the page is past the end of whichever file backs it.
+      // Stop here and let the caller zero-fill and report SHORT_READ, which
+      // is what SQLite expects for a read past end-of-file.
+      if (n < want) break;
+    }
+
+    return filled;
+  }
+
   xFileSize(fileId: number, pSize64: DataView): number {
     const f = this.#files.get(fileId);
     if (!f) return VFS.SQLITE_IOERR;
     try {
-      pSize64.setBigInt64(0, BigInt(f.size), true);
+      // With an overlay, the last commit frame's page count is the size of
+      // the database SQLite should see — not the main file's size on disk.
+      // The two differ in both directions: the WAL can hold pages appended
+      // past the end of the main file (reporting the smaller size makes
+      // SQLite treat live pages as beyond EOF), and a commit can shrink the
+      // database below what the main file still occupies.
+      const size = f.overlay
+        ? f.overlay.snapshot.dbSizePages * f.overlay.snapshot.pageSize
+        : f.size;
+      pSize64.setBigInt64(0, BigInt(size), true);
       return VFS.SQLITE_OK;
     } catch {
       return VFS.SQLITE_IOERR_FSTAT;

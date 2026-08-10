@@ -173,6 +173,11 @@ export async function syncMeetings(deps: SyncDeps): Promise<SyncReport> {
     const result = await withRetry(async () => {
       const db = await deps.openDatabase(deps.databasePath);
       try {
+        // Integer count or 'none' — never content. Distinguishes "Wispr has
+        // no meetings" from "the WAL was not read", which are otherwise
+        // indistinguishable in a bug report and were the whole reason the
+        // pre-overlay data loss went unnoticed.
+        log(`wal frames overlaid: ${db.walFrames ?? 'none'}`);
         const probe = await probeSchema(db);
         if (!probe.ok) return { missing: probe.missing, rows: [] as MeetingRow[] };
         const rows = await listMeetings(db, {

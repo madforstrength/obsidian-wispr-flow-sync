@@ -5,13 +5,20 @@
 // below.
 import SQLiteESMFactory from 'wa-sqlite/dist/wa-sqlite.mjs';
 import * as SQLite from 'wa-sqlite';
-import { NodeReadOnlyVFS, type Fs, type VfsOwner } from './vfs';
+import { NodeReadOnlyVFS, type Fs, type VfsOwner, type WalOverlay } from './vfs';
+import { readMainDbPageSize, readWalSnapshot, saltsUnchanged } from './wal';
 import { WASM_BASE64 } from './wasmBinary';
 import { requireFs } from '../node-runtime';
 
 export interface WisprDb {
   all(sql: string): Promise<unknown[][]>;
   close(): Promise<void>;
+  /** Frames overlaid from the `-wal` file, or null when there was no usable
+   *  WAL. Surfaced for the debug log: "0 meetings found" and "the WAL was
+   *  not read" look identical from the outside, and that ambiguity is what
+   *  made the pre-overlay data loss invisible for so long. Content-free —
+   *  an integer count, safe for the log file. */
+  walFrames: number | null;
   /** Per-handle page-read accounting. NOTE: no production code consumes this —
    *  it exists so the test suite can prove the lazy-paging property this whole
    *  VFS approach rests on (reading ~52 KB of a 217 MB database). It is kept
@@ -148,6 +155,42 @@ export async function openWisprDatabase(dbPath: string): Promise<WisprDb> {
   const sqlite3 = await getSqlite3();
   const sharedVfs = getVfs(sqlite3, fs);
 
+  // Build the WAL read snapshot BEFORE open_v2, and keep its descriptor for
+  // the lifetime of this handle. Wispr Flow's own connection stays open, so
+  // flow.sqlite is routinely checkpointed only rarely; without this, every
+  // query below sees the main file alone. See wal.ts for the full rationale
+  // and the measurement that motivated it.
+  //
+  // Every failure here is non-fatal by design: a missing, empty, truncated
+  // or corrupt WAL simply yields no overlay, and the handle behaves exactly
+  // as it did before this existed rather than refusing to open.
+  const walPath = `${dbPath}-wal`;
+  let walFd: number | null = null;
+  let overlay: WalOverlay | null = null;
+  try {
+    walFd = fs.openSync(walPath, 'r');
+    const snapshot = readWalSnapshot(fs, walFd, readMainDbPageSize(fs, dbPath));
+    if (snapshot) {
+      overlay = { dbPath, walFd, snapshot };
+    } else {
+      fs.closeSync(walFd);
+      walFd = null;
+    }
+  } catch {
+    if (walFd !== null) {
+      try { fs.closeSync(walFd); } catch { /* already gone */ }
+      walFd = null;
+    }
+    overlay = null;
+  }
+
+  /** Releases the WAL descriptor exactly once, from any exit path. */
+  const releaseWal = (): void => {
+    if (walFd === null) return;
+    try { fs.closeSync(walFd); } catch { /* already gone */ }
+    walFd = null;
+  };
+
   // The VFS is a shared singleton, so its read/byte counters cannot be a
   // single flat total — a second handle opened while this one is still
   // open would otherwise have its reads misattributed to whichever handle
@@ -159,12 +202,14 @@ export async function openWisprDatabase(dbPath: string): Promise<WisprDb> {
   // at the same time. That window is serialized by withSqliteLock above
   // (Findings 7 & 8) so it can never overlap any other handle's open, query,
   // or close.
-  const { owner, db } = await withSqliteLock(async (): Promise<{ owner: VfsOwner; db: number }> => {
-    const openedOwner = sharedVfs.beginOpen();
+  const opened = await withSqliteLock(async (): Promise<{ owner: VfsOwner; db: number }> => {
+    const openedOwner = sharedVfs.beginOpen(overlay);
     let openedDb: number;
     try {
       // immutable=1 skips the WAL and -shm and takes no locks. Required: this
       // VFS implements no shared-memory methods and flow.sqlite is in WAL mode.
+      // The WAL is not thereby ignored — the overlay passed to beginOpen()
+      // above reads it directly, without locks or shared memory. See wal.ts.
       openedDb = await sqlite3.open_v2(
         `file:${dbPath}?immutable=1`,
         SQLite.SQLITE_OPEN_READONLY | SQLite.SQLITE_OPEN_URI,
@@ -180,6 +225,21 @@ export async function openWisprDatabase(dbPath: string): Promise<WisprDb> {
       throw err;
     } finally {
       sharedVfs.endOpen();
+    }
+
+    // Checked inside the lock, before the handle escapes: if a snapshot was
+    // built but never attached to a file, SQLite opened the database under
+    // a path this VFS did not recognise and every query would silently read
+    // the main file alone. Failing here is deliberate — that silence is the
+    // original bug, and a handle that quietly loses the WAL is worse than
+    // no handle at all. The sync engine's withRetry will re-attempt, then
+    // surface the message to the user.
+    if (overlay && !sharedVfs.didAttachOverlay()) {
+      await sqlite3.close(openedDb);
+      sharedVfs.forgetOwner(openedOwner);
+      throw new Error(
+        `Internal error: the write-ahead log for ${dbPath} was read but could not be attached to the open database.`
+      );
     }
 
     try {
@@ -206,14 +266,23 @@ export async function openWisprDatabase(dbPath: string): Promise<WisprDb> {
     }
 
     return { owner: openedOwner, db: openedDb };
-  });
+  })
+    // A throwing open leaves no handle for anyone to close, so the WAL
+    // descriptor it claimed has to be released right here or it leaks for
+    // the rest of the session — one fd per failed open.
+    .catch((err: unknown) => {
+      releaseWal();
+      throw err;
+    });
 
+  const { owner, db } = opened;
   let closed = false;
 
   return {
     get stats() {
       return sharedVfs.statsFor(owner);
     },
+    walFrames: overlay ? overlay.snapshot.frames : null,
     async all(sql: string): Promise<unknown[][]> {
       // Routed through the shared lock (Finding 8): two handles' `all()`
       // calls racing directly against the WASM module — with no opening
@@ -222,6 +291,15 @@ export async function openWisprDatabase(dbPath: string): Promise<WisprDb> {
       return withSqliteLock(async () => {
         const rows: unknown[][] = [];
         await sqlite3.exec(db, sql, (row: unknown[]) => { rows.push([...row]); });
+        // A checkpoint that RESTARTS the WAL rewrites it from the top with
+        // new salts, so this snapshot's byte offsets would then address
+        // unrelated frames — the one way this design could return silently
+        // wrong rows instead of an error. The salt check costs a 32-byte
+        // read per query and converts that into a thrown error, which the
+        // sync engine's withRetry re-runs against a fresh snapshot.
+        if (overlay && walFd !== null && !saltsUnchanged(fs, walFd, overlay.snapshot)) {
+          throw new Error('Wispr Flow checkpointed its database mid-read; retrying');
+        }
         return rows;
       });
     },
@@ -237,8 +315,15 @@ export async function openWisprDatabase(dbPath: string): Promise<WisprDb> {
       // handle while another handle's open/query/close is in flight is the
       // same class of overlapping-WASM-call corruption.
       await withSqliteLock(async () => {
-        await sqlite3.close(db);
-        sharedVfs.forgetOwner(owner);
+        try {
+          await sqlite3.close(db);
+          sharedVfs.forgetOwner(owner);
+        } finally {
+          // In a finally: a close that throws must still release the WAL
+          // descriptor, or a session that hits repeated close failures
+          // accumulates fds until Obsidian restarts.
+          releaseWal();
+        }
       });
     },
   };
