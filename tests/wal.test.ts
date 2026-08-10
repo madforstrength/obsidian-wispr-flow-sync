@@ -254,6 +254,32 @@ describe('openWisprDatabase with a WAL overlay', () => {
     }
   });
 
+  it('fails the query, rather than returning rows, when the WAL is restarted mid-read', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wispr-wal-'));
+    try {
+      const db = await twoCommitDatabase(dir);
+      const wal = `${db}-wal`;
+      const handle = await openWisprDatabase(db);
+      try {
+        expect(await handle.all('SELECT id FROM t ORDER BY id')).toEqual([[1], [2]]);
+
+        // Simulate the one case that could otherwise return silently wrong
+        // rows: a checkpoint restarts the WAL, rewriting it in place under
+        // new salts, so the snapshot's byte offsets now address unrelated
+        // frames. Rewriting the header salts is exactly what that does.
+        const bytes = readFileSync(wal);
+        bytes[16] ^= 0xff;
+        writeFileSync(wal, bytes);
+
+        await expect(handle.all('SELECT id FROM t ORDER BY id')).rejects.toThrow(/checkpointed/i);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps the lazy-paging property with an overlay attached', async () => {
     const db = await openWisprDatabase(DB);
     try {
