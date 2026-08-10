@@ -22,7 +22,14 @@ export interface WisprDb {
   /** Per-handle page-read accounting. NOTE: no production code consumes this —
    *  it exists so the test suite can prove the lazy-paging property this whole
    *  VFS approach rests on (reading ~52 KB of a 217 MB database). It is kept
-   *  deliberately, not by accident. */
+   *  deliberately, not by accident.
+   *
+   *  Counts reads SQLite asks for, and therefore excludes the one sequential
+   *  pass `wal.ts` makes over the `-wal` file when the handle is opened —
+   *  that pass has to touch every frame to verify its checksum. Total I/O
+   *  per open is these bytes PLUS the size of the WAL (2.9 MB on a measured
+   *  real install; bounded in practice by SQLite's ~4 MB auto-checkpoint
+   *  threshold, and still small against the database it saves us reading). */
   stats: { reads: number; bytes: number };
 }
 

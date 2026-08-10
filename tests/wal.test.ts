@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import {
   closeSync,
   copyFileSync,
@@ -8,6 +8,8 @@ import {
   openSync,
   readFileSync,
   rmSync,
+  statSync,
+  truncateSync,
   writeFileSync,
 } from 'node:fs';
 import * as fs from 'node:fs';
@@ -27,6 +29,50 @@ function withWalFd<T>(path: string, fn: (fd: number) => T): T {
   } finally {
     closeSync(fd);
   }
+}
+
+/**
+ * Runs SQL against `dbPath` and SIGKILLs sqlite3 once it acknowledges, so
+ * the committed frames stay in the -wal. Same technique, and the same
+ * reasons, as scripts/make-fixture.mjs: `wal_autocheckpoint=0` stops a
+ * commit from folding itself back into the main file, and a clean exit
+ * would checkpoint on closing the last connection. stdin is left open so
+ * the CLI never reaches end-of-input and exits on its own.
+ */
+function sqliteLeavingWal(dbPath: string, sql: string): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn('sqlite3', [dbPath]);
+    let stdout = '';
+    let killed = false;
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk);
+      if (!killed && stdout.includes('READY')) {
+        killed = true;
+        child.kill('SIGKILL');
+      }
+    });
+    child.on('error', reject);
+    child.on('exit', () =>
+      killed ? resolvePromise() : reject(new Error(`sqlite3 exited early: ${stdout}`))
+    );
+    child.stdin.write(`PRAGMA wal_autocheckpoint=0;\n${sql}\nSELECT 'READY';\n`);
+  });
+}
+
+/** A database whose -wal holds TWO separate committed transactions, so the
+ *  "stop at the last commit" rule has something to stop *at* — the shared
+ *  fixture has a single commit, where any tear wipes out everything and the
+ *  rule is untestable. */
+async function twoCommitDatabase(dir: string): Promise<string> {
+  const db = join(dir, 'two-commits.sqlite');
+  execFileSync('sqlite3', [db], {
+    input: 'PRAGMA journal_mode=WAL;\nCREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);\n',
+  });
+  await sqliteLeavingWal(
+    db,
+    "BEGIN;INSERT INTO t VALUES (1,'first');COMMIT;\nBEGIN;INSERT INTO t VALUES (2,'second');COMMIT;"
+  );
+  return db;
 }
 
 describe('the fixture itself', () => {
@@ -85,21 +131,62 @@ describe('readWalSnapshot', () => {
     }
   });
 
-  it('stops at the last valid frame when the tail is torn', () => {
+  it('drops a torn tail but keeps the commit before it', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'wispr-wal-'));
     try {
-      const torn = join(dir, 'torn.sqlite-wal');
-      const bytes = readFileSync(WAL);
-      const whole = withWalFd(WAL, (fd) => readWalSnapshot(fs, fd, null))!;
-      // Corrupt the payload of the LAST frame: its checksum no longer
-      // matches, so recovery must stop before it. A reader that trusted the
-      // frame header alone would hand SQLite a torn page.
+      const db = await twoCommitDatabase(dir);
+      const wal = `${db}-wal`;
+      const whole = withWalFd(wal, (fd) => readWalSnapshot(fs, fd, null))!;
+      expect(whole.frames).toBeGreaterThanOrEqual(2);
+
+      // Corrupt the payload of the LAST frame: its checksum stops matching,
+      // so recovery must stop before it and fall back to the previous
+      // commit. A reader that trusted the frame header alone would hand
+      // SQLite a torn page.
+      const bytes = readFileSync(wal);
       bytes[bytes.byteLength - 1] ^= 0xff;
-      writeFileSync(torn, bytes);
-      const snapshot = withWalFd(torn, (fd) => readWalSnapshot(fs, fd, null));
-      // Either the truncated prefix still ends at an earlier commit (fewer
-      // frames), or there is no complete commit left at all.
-      if (snapshot) expect(snapshot.frames).toBeLessThan(whole.frames);
+      writeFileSync(wal, bytes);
+
+      const torn = withWalFd(wal, (fd) => readWalSnapshot(fs, fd, null));
+      expect(torn).not.toBeNull();
+      expect(torn!.frames).toBeLessThan(whole.frames);
+
+      // The rule that matters, end to end: the first transaction survives,
+      // the torn one is invisible. Committed data is never lost to a torn
+      // tail, and uncommitted data is never exposed by one.
+      const handle = await openWisprDatabase(db);
+      try {
+        expect(await handle.all('SELECT id FROM t ORDER BY id')).toEqual([[1]]);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores a transaction whose frames are present but uncommitted', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wispr-wal-'));
+    try {
+      const db = await twoCommitDatabase(dir);
+      const wal = `${db}-wal`;
+      const whole = withWalFd(wal, (fd) => readWalSnapshot(fs, fd, null))!;
+
+      // Truncate the final frame away entirely, mid-write, which is what a
+      // crash during Wispr Flow's next transaction would leave behind. The
+      // remaining bytes are all individually valid — only the commit marker
+      // is gone — so this exercises the commit rule rather than the
+      // checksum check that the torn-tail case above covers.
+      const frameSize = 24 + whole.pageSize;
+      truncateSync(wal, statSync(wal).size - Math.floor(frameSize / 2));
+
+      const handle = await openWisprDatabase(db);
+      try {
+        expect(await handle.all('SELECT id FROM t ORDER BY id')).toEqual([[1]]);
+        expect(handle.walFrames).toBeLessThan(whole.frames);
+      } finally {
+        await handle.close();
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
