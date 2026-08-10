@@ -54,10 +54,19 @@ export interface WalSnapshot {
    *  main file has never seen, and a commit can shrink the database). */
   dbSizePages: number;
   /** Header salts. A checkpoint that restarts the WAL rewrites these, which
-   *  is how `saltsUnchanged` detects that this snapshot's offsets have gone
+   *  is how `walStillCurrent` detects that this snapshot's offsets have gone
    *  stale underneath us. */
   salt1: number;
   salt2: number;
+  /** Filesystem identity of the `-wal` this snapshot came from. Salts alone
+   *  cannot detect unlink-and-recreate: an unlinked file stays readable
+   *  through an open descriptor with its bytes — and therefore its salts —
+   *  frozen forever, so a WAL that was deleted and replaced would keep
+   *  passing a salts-only check while the database moved on without it.
+   *  On Windows `ino` may be 0 for both sides, in which case this check
+   *  degrades to the salts alone rather than misfiring. */
+  dev: number;
+  ino: number;
   /** Frames accepted into `pages`. Diagnostics only. */
   frames: number;
 }
@@ -149,7 +158,8 @@ export function readWalSnapshot(
   walFd: number,
   expectedPageSize: number | null
 ): WalSnapshot | null {
-  const size = fs.fstatSync(walFd).size;
+  const stat = fs.fstatSync(walFd);
+  const size = stat.size;
   if (size < WAL_HEADER_SIZE + FRAME_HEADER_SIZE) return null;
 
   const header = new Uint8Array(WAL_HEADER_SIZE);
@@ -229,30 +239,53 @@ export function readWalSnapshot(
     dbSizePages: frames[lastCommit].dbSizePages,
     salt1,
     salt2,
+    dev: Number(stat.dev),
+    ino: Number(stat.ino),
     frames: lastCommit + 1,
   };
 }
 
 /**
- * Cheap (32-byte) re-read of the WAL header, to confirm a snapshot's page
- * offsets still mean what they meant when it was taken.
+ * Confirms a snapshot's page offsets still mean what they meant when it was
+ * taken. Two distinct ways they can stop meaning it, and both are checked:
  *
- * A checkpoint does not merely append: once the WAL has been fully copied
- * back into the database, the next writer RESTARTS it, overwriting frames
- * from the beginning of the same file with new salts. Our recorded offsets
- * would then point at unrelated pages — the one failure mode of this design
- * that could surface as silent wrong data rather than an error. The salts
- * change on every restart, so comparing them turns that into a detectable
- * event, which the caller reports as an error and the sync engine's
- * `withRetry` re-runs from a fresh snapshot.
+ *  1. **Restart in place.** A checkpoint does not merely append: once the
+ *     WAL has been copied back into the database, the next writer RESTARTS
+ *     it, overwriting frames from the beginning of the same file under new
+ *     salts. Our offsets would then address unrelated pages. Caught by
+ *     re-reading the 32-byte header through the SAME descriptor and
+ *     comparing salts.
+ *
+ *  2. **Unlink and recreate.** If Wispr Flow closes its last connection,
+ *     SQLite checkpoints and DELETES the WAL; a later launch creates a new
+ *     one at the same path. Our descriptor still refers to the old, now
+ *     unlinked inode, whose bytes — and therefore whose salts — never
+ *     change again, so check (1) passes forever while the database moves on
+ *     without us. Caught by comparing the path's current identity against
+ *     the identity the snapshot was built from.
+ *
+ * Both are reported the same way: the caller raises an error and the sync
+ * engine's `withRetry` re-runs from a fresh snapshot. A missing WAL counts
+ * as changed — that is the clean-shutdown case, and the retry will find the
+ * data checkpointed into the main file where it belongs.
  */
-export function saltsUnchanged(fs: Fs, walFd: number, snapshot: WalSnapshot): boolean {
+export function walStillCurrent(
+  fs: Fs,
+  walFd: number,
+  walPath: string,
+  snapshot: WalSnapshot
+): boolean {
   try {
+    const current = fs.statSync(walPath);
+    if (Number(current.dev) !== snapshot.dev || Number(current.ino) !== snapshot.ino) return false;
+
     const header = new Uint8Array(WAL_HEADER_SIZE);
     if (fs.readSync(walFd, header, 0, WAL_HEADER_SIZE, 0) !== WAL_HEADER_SIZE) return false;
     const hv = new DataView(header.buffer, header.byteOffset, header.byteLength);
     return hv.getUint32(16, false) === snapshot.salt1 && hv.getUint32(20, false) === snapshot.salt2;
   } catch {
+    // statSync throws when the WAL has been deleted outright — the same
+    // staleness, reported the same way.
     return false;
   }
 }

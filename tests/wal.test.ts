@@ -15,8 +15,9 @@ import {
 import * as fs from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { readMainDbPageSize, readWalSnapshot, saltsUnchanged } from '../src/wispr/wal';
+import { readMainDbPageSize, readWalSnapshot, walStillCurrent } from '../src/wispr/wal';
 import { openWisprDatabase } from '../src/wispr/db';
+import { NodeReadOnlyVFS } from '../src/wispr/vfs';
 
 const DB = resolve('tests/fixtures/wispr-fixture.sqlite');
 const WAL = `${DB}-wal`;
@@ -204,18 +205,50 @@ describe('readWalSnapshot', () => {
   });
 });
 
-describe('saltsUnchanged', () => {
-  it('accepts an unmodified WAL and rejects one that was restarted', () => {
+describe('walStillCurrent', () => {
+  it('accepts an unmodified WAL', () => {
     const snapshot = withWalFd(WAL, (fd) => readWalSnapshot(fs, fd, null))!;
-    expect(withWalFd(WAL, (fd) => saltsUnchanged(fs, fd, snapshot))).toBe(true);
+    expect(withWalFd(WAL, (fd) => walStillCurrent(fs, fd, WAL, snapshot))).toBe(true);
+  });
 
+  it('rejects a WAL that was restarted in place', () => {
     const dir = mkdtempSync(join(tmpdir(), 'wispr-wal-'));
     try {
-      const restarted = join(dir, 'restarted.sqlite-wal');
-      const bytes = readFileSync(WAL);
+      const copy = join(dir, 'restarted.sqlite-wal');
+      writeFileSync(copy, readFileSync(WAL));
+      const snapshot = withWalFd(copy, (fd) => readWalSnapshot(fs, fd, null))!;
+      const bytes = readFileSync(copy);
       bytes[16] ^= 0xff; // a checkpoint restart rewrites salt-1
-      writeFileSync(restarted, bytes);
-      expect(withWalFd(restarted, (fd) => saltsUnchanged(fs, fd, snapshot))).toBe(false);
+      writeFileSync(copy, bytes);
+      expect(withWalFd(copy, (fd) => walStillCurrent(fs, fd, copy, snapshot))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a WAL that was deleted, or replaced by a new file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wispr-wal-'));
+    try {
+      const copy = join(dir, 'replaced.sqlite-wal');
+      writeFileSync(copy, readFileSync(WAL));
+      // Hold the descriptor open across the deletion, exactly as a live
+      // handle would: the unlinked inode stays readable and its salts stay
+      // frozen, so a salts-only check would keep saying "unchanged".
+      const fd = openSync(copy, 'r');
+      try {
+        const snapshot = readWalSnapshot(fs, fd, null)!;
+        expect(walStillCurrent(fs, fd, copy, snapshot)).toBe(true);
+
+        rmSync(copy);
+        expect(walStillCurrent(fs, fd, copy, snapshot)).toBe(false);
+
+        // Recreated at the same path with identical bytes: same salts, new
+        // inode. Only the identity check can tell these apart.
+        writeFileSync(copy, readFileSync(WAL));
+        expect(walStillCurrent(fs, fd, copy, snapshot)).toBe(false);
+      } finally {
+        closeSync(fd);
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -271,7 +304,37 @@ describe('openWisprDatabase with a WAL overlay', () => {
         bytes[16] ^= 0xff;
         writeFileSync(wal, bytes);
 
-        await expect(handle.all('SELECT id FROM t ORDER BY id')).rejects.toThrow(/checkpointed/i);
+        await expect(handle.all('SELECT id FROM t ORDER BY id')).rejects.toThrow(
+          /replaced its write-ahead log/i
+        );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails the query when the WAL is deleted and recreated mid-read', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wispr-wal-'));
+    try {
+      const db = await twoCommitDatabase(dir);
+      const wal = `${db}-wal`;
+      const original = readFileSync(wal);
+      const handle = await openWisprDatabase(db);
+      try {
+        expect(await handle.all('SELECT id FROM t ORDER BY id')).toEqual([[1], [2]]);
+
+        // Wispr Flow quitting checkpoints and deletes the WAL; relaunching
+        // creates a new one at the same path. Our descriptor still reads the
+        // unlinked inode, whose salts are frozen, so a salts-only check would
+        // happily go on serving pages from a file the database has abandoned.
+        rmSync(wal);
+        writeFileSync(wal, original);
+
+        await expect(handle.all('SELECT id FROM t ORDER BY id')).rejects.toThrow(
+          /replaced its write-ahead log/i
+        );
       } finally {
         await handle.close();
       }
@@ -287,6 +350,53 @@ describe('openWisprDatabase with a WAL overlay', () => {
       expect(db.stats.bytes).toBeLessThan(512 * 1024);
     } finally {
       await db.close();
+    }
+  });
+});
+
+describe('xRead honours the logical EOF that xFileSize advertises', () => {
+  // SQLite should never ask for a page past the size we report, so this
+  // cannot be reached through a query — it is asserted against the VFS
+  // directly. The case it guards: a commit that SHRINKS the database leaves
+  // frames for pages above the new size still in the WAL from earlier
+  // transactions, and serving those would contradict xFileSize.
+  it('short-reads past dbSizePages instead of serving stale higher pages', () => {
+    const vfs = new NodeReadOnlyVFS('test-eof', fs);
+    const walFd = openSync(WAL, 'r');
+    try {
+      const real = readWalSnapshot(fs, walFd, null)!;
+      // Pretend the last commit shrank the database to a single page, while
+      // the page map still holds everything the WAL ever wrote.
+      const shrunk = { ...real, dbSizePages: 1 };
+      const visibleSize = shrunk.pageSize;
+
+      const owner = vfs.beginOpen({ dbPath: WAL, walFd, snapshot: shrunk });
+      const flags = new DataView(new ArrayBuffer(4));
+      expect(vfs.xOpen(WAL, 1, 0, flags)).toBe(0);
+      vfs.endOpen();
+      try {
+        const size = new DataView(new ArrayBuffer(8));
+        expect(vfs.xFileSize(1, size)).toBe(0);
+        expect(Number(size.getBigInt64(0, true))).toBe(visibleSize);
+
+        // Entirely past the logical end: nothing may be returned, and the
+        // buffer must come back zeroed rather than carrying WAL bytes.
+        const past = new Uint8Array(64).fill(0xab);
+        const rc = vfs.xRead(1, past, visibleSize);
+        expect(rc).not.toBe(0); // SQLITE_IOERR_SHORT_READ, not OK
+        expect([...past].every((b) => b === 0)).toBe(true);
+
+        // Straddling the boundary: the part below the limit is served, the
+        // remainder is zero-filled.
+        const straddle = new Uint8Array(32).fill(0xab);
+        expect(vfs.xRead(1, straddle, visibleSize - 16)).not.toBe(0);
+        expect([...straddle.subarray(16)].every((b) => b === 0)).toBe(true);
+      } finally {
+        vfs.xClose(1);
+        vfs.forgetOwner(owner);
+      }
+    } finally {
+      closeSync(walFd);
     }
   });
 });

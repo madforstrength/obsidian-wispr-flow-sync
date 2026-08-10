@@ -6,7 +6,7 @@
 import SQLiteESMFactory from 'wa-sqlite/dist/wa-sqlite.mjs';
 import * as SQLite from 'wa-sqlite';
 import { NodeReadOnlyVFS, type Fs, type VfsOwner, type WalOverlay } from './vfs';
-import { readMainDbPageSize, readWalSnapshot, saltsUnchanged } from './wal';
+import { readMainDbPageSize, readWalSnapshot, walStillCurrent } from './wal';
 import { WASM_BASE64 } from './wasmBinary';
 import { requireFs } from '../node-runtime';
 
@@ -304,8 +304,8 @@ export async function openWisprDatabase(dbPath: string): Promise<WisprDb> {
         // wrong rows instead of an error. The salt check costs a 32-byte
         // read per query and converts that into a thrown error, which the
         // sync engine's withRetry re-runs against a fresh snapshot.
-        if (overlay && walFd !== null && !saltsUnchanged(fs, walFd, overlay.snapshot)) {
-          throw new Error('Wispr Flow checkpointed its database mid-read; retrying');
+        if (overlay && walFd !== null && !walStillCurrent(fs, walFd, walPath, overlay.snapshot)) {
+          throw new Error('Wispr Flow replaced its write-ahead log mid-read');
         }
         return rows;
       });
@@ -324,11 +324,12 @@ export async function openWisprDatabase(dbPath: string): Promise<WisprDb> {
       await withSqliteLock(async () => {
         try {
           await sqlite3.close(db);
-          sharedVfs.forgetOwner(owner);
         } finally {
-          // In a finally: a close that throws must still release the WAL
-          // descriptor, or a session that hits repeated close failures
-          // accumulates fds until Obsidian restarts.
+          // Both in the finally: a close that throws must still release the
+          // WAL descriptor and this handle's stats bucket, or a session
+          // hitting repeated close failures accumulates one fd and one Map
+          // entry each time until Obsidian restarts.
+          sharedVfs.forgetOwner(owner);
           releaseWal();
         }
       });

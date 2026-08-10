@@ -177,8 +177,14 @@ export class NodeReadOnlyVFS extends VFSBase implements SQLiteVFS {
       try { this.#fs.closeSync(existing.fd); } catch { /* already gone */ }
       this.#files.delete(fileId);
     }
+    // Held outside the try so the catch can close a descriptor that was
+    // opened but never made it into #files — fstatSync below can throw
+    // between those two points, and the map is the only thing xClose ever
+    // consults, so such an fd would be unreachable and leak for the life of
+    // the session.
+    let fd: number | null = null;
     try {
-      const fd = this.#fs.openSync(path, 'r');
+      fd = this.#fs.openSync(path, 'r');
       // Matched by path, not "the first file opened": with immutable=1
       // SQLite opens only the main database, but that is its choice, not a
       // guarantee we should encode. Attaching by path means a temp or
@@ -188,14 +194,20 @@ export class NodeReadOnlyVFS extends VFSBase implements SQLiteVFS {
         this.#currentOverlay && NodeReadOnlyVFS.#samePath(this.#currentOverlay.dbPath, path)
           ? this.#currentOverlay
           : undefined;
+      const size = this.#fs.fstatSync(fd).size;
+      this.#files.set(fileId, { fd, size, overlay });
+      // Only after ownership has transferred into #files: an early return
+      // below must not leave this set for a file that was never attached.
       if (overlay) this.#overlayAttached = true;
-      this.#files.set(fileId, { fd, size: this.#fs.fstatSync(fd).size, overlay });
       if (this.#currentOwner !== null) {
         this.#ownerByFileId.set(fileId, this.#currentOwner);
       }
       pOutFlags.setInt32(0, VFS.SQLITE_OPEN_READONLY, true);
       return VFS.SQLITE_OK;
     } catch {
+      if (fd !== null && !this.#files.has(fileId)) {
+        try { this.#fs.closeSync(fd); } catch { /* already gone */ }
+      }
       return VFS.SQLITE_CANTOPEN;
     }
   }
@@ -254,14 +266,26 @@ export class NodeReadOnlyVFS extends VFSBase implements SQLiteVFS {
    * so the caller's short-read handling is unchanged.
    */
   #readWithOverlay(f: OpenFile, overlay: WalOverlay, pData: Uint8Array, iOffset: number): number {
-    const { pages, pageSize } = overlay.snapshot;
+    const { pages, pageSize, dbSizePages } = overlay.snapshot;
+    // The logical end of the database for this snapshot — the same number
+    // xFileSize reports. Reads must respect it, or the two disagree: a
+    // commit that SHRANK the database leaves frames for pages above the new
+    // size still sitting in the map from earlier transactions in the same
+    // WAL, and serving those would hand back bytes from beyond the file
+    // SQLite believes it opened, instead of the short read it expects.
+    const visibleSize = dbSizePages * pageSize;
     let filled = 0;
 
     while (filled < pData.byteLength) {
       const position = iOffset + filled;
+      if (position >= visibleSize) break;
       const pageNo = Math.floor(position / pageSize) + 1;
       const withinPage = position % pageSize;
-      const want = Math.min(pData.byteLength - filled, pageSize - withinPage);
+      const want = Math.min(
+        pData.byteLength - filled,
+        pageSize - withinPage,
+        visibleSize - position
+      );
       const target = pData.subarray(filled, filled + want);
 
       const frameDataOffset = pages.get(pageNo);
